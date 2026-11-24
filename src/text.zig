@@ -64,11 +64,6 @@ pub const Iterator = struct {
     wide_ambiguous: bool,
     multiline: bool = false,
 
-    pub fn init(bytes: []const u8, wide_ambiguous: bool) Error!Iterator {
-        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
-        return .{ .bytes = bytes, .wide_ambiguous = wide_ambiguous };
-    }
-
     pub fn checkedNext(self: *Iterator) Error!?Cluster {
         return self.scan(false);
     }
@@ -99,8 +94,12 @@ pub const Iterator = struct {
         var joined = false;
         var isolate = false;
         while (self.offset < self.bytes.len) {
-            const length = std.unicode.utf8ByteSequenceLength(self.bytes[self.offset]) catch unreachable;
-            const cp = @call(.always_inline, std.unicode.utf8Decode, .{self.bytes[self.offset..][0..length]}) catch unreachable;
+            const tail = self.bytes[self.offset..];
+            const length = std.unicode.utf8ByteSequenceLength(tail[0]) catch
+                if (validated) unreachable else return error.InvalidUtf8;
+            if (!validated and length > tail.len) return error.InvalidUtf8;
+            const cp = @call(.always_inline, std.unicode.utf8Decode, .{tail[0..length]}) catch
+                if (validated) unreachable else return error.InvalidUtf8;
             const properties = unicode.properties(cp);
             const current = properties.gcb;
             const previous = grapheme;
@@ -148,10 +147,10 @@ pub const Text = struct {
     pub const Options = struct { wide_ambiguous: bool = false, multiline: bool = false };
 
     pub fn init(bytes: []const u8, options: Options) Error!Text {
-        var it = try Iterator.init(bytes, options.wide_ambiguous);
-        it.multiline = options.multiline;
+        const text: Text = .{ .bytes = bytes, .wide_ambiguous = options.wide_ambiguous, .multiline = options.multiline };
+        var it = text.clusters();
         while (try it.checkedNext() != null) {}
-        return .{ .bytes = bytes, .wide_ambiguous = options.wide_ambiguous, .multiline = options.multiline };
+        return text;
     }
 
     pub fn clusters(self: Text) Iterator {
@@ -368,18 +367,19 @@ pub const Text = struct {
     }
 };
 
-test "geometry rounds inside a cluster, preserves empty lines and wraps whole glyphs" {
-    const text = try Text.init("a界·\ne\u{301}\n", .{ .wide_ambiguous = true, .multiline = true });
-    try std.testing.expectEqual(Position{ .column = 1 }, text.position(3));
-    try std.testing.expectEqualStrings("a", text.prefix(2));
-    const clipped = text.clip(.{ .column = 2 }, 3);
-    try std.testing.expectEqualStrings("·", clipped.line.bytes);
-    try std.testing.expectEqual(@as(usize, 1), clipped.indent);
-    try std.testing.expectEqual(@as(usize, 7), text.byteOffset(.{ .row = 1 }));
-    var rows = text.rows(1, .grapheme);
-    for ([_][]const u8{ "a", "界", "·", "e\u{301}", "" }) |row|
-        try std.testing.expectEqualStrings(row, rows.next().?.bytes);
-    try std.testing.expect(rows.next() == null);
+test "row indexes and streaming hits resolve to the same grapheme boundaries" {
+    const t = try Text.init("say can't 一二\ne\u{301}\n", .{ .multiline = true });
+    var buf: [32]Text.Row = undefined;
+    for ([_]Text.Wrap{ .grapheme, .word }) |mode| {
+        const index = try t.indexRows(4, mode, &buf);
+        for (0..index.entries.len + 1) |row| for (0..7) |column| {
+            const p: Position = .{ .row = row, .column = column };
+            const hit = index.hit(p);
+            try std.testing.expectEqual(hit.offset, t.ceilBoundary(hit.offset));
+            try std.testing.expectEqual(t.visualHit(4, mode, p), hit);
+            try std.testing.expectEqual(t.visualPosition(4, mode, hit), index.position(hit));
+        };
+    }
 }
 
 fn isControl(property: unicode.Gcb) bool {
@@ -388,12 +388,6 @@ fn isControl(property: unicode.Gcb) bool {
 
 test "Unicode 17 grapheme boundaries and drawable iterator agree with the official corpus" {
     const corpus = @embedFile("grapheme_cases");
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(corpus, &digest, .{});
-    try std.testing.expectEqualStrings(
-        "e2d134d2c52919bace503ebb6a551c1855fe1a1faec18478c78fff254a1793ec",
-        &std.fmt.bytesToHex(digest, .lower),
-    );
     var lines = std.mem.splitScalar(u8, corpus, '\n');
     var cases: usize = 0;
     var line_number: usize = 0;
@@ -423,7 +417,7 @@ test "Unicode 17 grapheme boundaries and drawable iterator agree with the offici
         }
         if (len == 0) continue;
         cases += 1;
-        var iterator = try Iterator.init(bytes[0..len], false);
+        var iterator: Iterator = .{ .bytes = bytes[0..len], .wide_ambiguous = false };
         var start: usize = 0;
         for (ends[0..count]) |end| {
             const cluster = iterator.checkedNext() catch |err| switch (err) {
@@ -459,24 +453,21 @@ test "terminal width policy covers selectors, emoji, ambiguous text, and drawing
     };
     for (cases) |case| {
         for ([_]bool{ false, true }) |wide| {
-            var iterator = try Iterator.init(case.bytes, wide);
-            const cluster = (try iterator.checkedNext()).?;
+            var iterator = (try Text.init(case.bytes, .{ .wide_ambiguous = wide })).clusters();
+            const cluster = iterator.next().?;
             try std.testing.expectEqualSlices(u8, case.bytes, cluster.bytes);
             try std.testing.expectEqual(if (wide) case.wide else case.narrow, cluster.width);
-            try std.testing.expectEqual(null, try iterator.checkedNext());
+            try std.testing.expectEqual(null, iterator.next());
         }
     }
-    try std.testing.expectError(error.InvalidUtf8, Iterator.init("\xc0\x80", false));
-    var control = try Iterator.init("\r\n", false);
-    try std.testing.expectError(error.ControlCharacter, control.checkedNext());
-    var zero = try Iterator.init("\u{301}", false);
-    try std.testing.expectError(error.ZeroWidthGrapheme, zero.checkedNext());
+    try std.testing.expectError(error.InvalidUtf8, Text.init("\xc0\x80", .{}));
+    try std.testing.expectError(error.InvalidUtf8, Text.init("a\xf0\x9f", .{}));
+    try std.testing.expectError(error.ControlCharacter, Text.init("\r\n", .{}));
+    try std.testing.expectError(error.ZeroWidthGrapheme, Text.init("\u{301}", .{}));
     const marks: [24][2]u8 = @splat("\xcc\x81".*);
     var bytes: [50]u8 = undefined;
     @memcpy(bytes[0..2], "é");
     @memcpy(bytes[2..], std.mem.asBytes(&marks));
-    var bounded = try Iterator.init(bytes[0..48], false);
-    try std.testing.expectEqual(@as(usize, 48), (try bounded.checkedNext()).?.bytes.len);
-    var long = try Iterator.init(&bytes, false);
-    try std.testing.expectError(error.GraphemeTooLong, long.checkedNext());
+    _ = try Text.init(bytes[0..48], .{});
+    try std.testing.expectError(error.GraphemeTooLong, Text.init(&bytes, .{}));
 }

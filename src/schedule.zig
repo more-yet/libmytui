@@ -1,6 +1,15 @@
 const std = @import("std");
-const input = @import("input.zig");
 const linux = @import("linux.zig");
+
+pub const Watch = enum(u64) { _ };
+pub const Timer = enum(u64) { _ };
+pub const Ready = struct {
+    watch: Watch,
+    readable: bool,
+    writable: bool,
+    hangup: bool,
+    failed: bool,
+};
 
 pub const Schedule = struct {
     io: std.Io,
@@ -16,12 +25,12 @@ pub const Schedule = struct {
     };
 
     pub const Alarm = struct {
-        id: ?input.Timer = null,
+        id: ?Timer = null,
         at: i96 = undefined,
         due: bool = false,
     };
 
-    pub fn arm(self: *Schedule, id: input.Timer, at: i96) !void {
+    pub fn arm(self: *Schedule, id: Timer, at: i96) !void {
         var empty: ?*Alarm = null;
         for (self.timers) |*alarm| {
             if (alarm.id == id) {
@@ -34,7 +43,7 @@ pub const Schedule = struct {
         alarm.* = .{ .id = id, .at = at };
     }
 
-    pub fn cancel(self: *Schedule, id: input.Timer) bool {
+    pub fn cancel(self: *Schedule, id: Timer) bool {
         for (self.timers) |*alarm| {
             if (alarm.id == id) {
                 alarm.* = .{};
@@ -47,7 +56,7 @@ pub const Schedule = struct {
     pub fn earliest(self: *const Schedule) ?i96 {
         var at: ?i96 = null;
         for (self.timers) |alarm| {
-            if (alarm.id != null and (at == null or alarm.at < at.?)) at = alarm.at;
+            if (alarm.id != null) at = @min(at orelse alarm.at, alarm.at);
         }
         return at;
     }
@@ -70,14 +79,14 @@ pub const Schedule = struct {
         watch_limit: u64 = 0,
         ready_index: usize = 0,
         timer_index: usize = 0,
-        pub fn nextReady(turn: *Turn) ?input.Event {
+        pub fn nextReady(turn: *Turn) ?Ready {
             while (turn.ready_index < turn.interests.len) {
                 const i = turn.ready_index;
                 turn.ready_index += 1;
                 const s = turn.schedule.sources[i];
                 const bits = turn.interests[i].revents;
                 if (bits == 0 or s.id == 0 or s.id >= turn.watch_limit) continue;
-                return .{ .ready = .{ .watch = @fromBackingInt(s.id), .readable = bits & std.posix.POLL.IN != 0, .writable = bits & std.posix.POLL.OUT != 0, .hangup = bits & std.posix.POLL.HUP != 0, .failed = bits & std.posix.POLL.ERR != 0 } };
+                return .{ .watch = @fromBackingInt(s.id), .readable = bits & std.posix.POLL.IN != 0, .writable = bits & std.posix.POLL.OUT != 0, .hangup = bits & std.posix.POLL.HUP != 0, .failed = bits & std.posix.POLL.ERR != 0 };
             }
             return null;
         }
@@ -85,7 +94,7 @@ pub const Schedule = struct {
             for (turn.schedule.timers) |*a| a.due = a.id != null and a.at <= now;
             turn.timer_index = 0;
         }
-        pub fn nextTimer(turn: *Turn) ?input.Timer {
+        pub fn nextTimer(turn: *Turn) ?Timer {
             while (turn.timer_index < turn.schedule.timers.len) {
                 const a = &turn.schedule.timers[turn.timer_index];
                 turn.timer_index += 1;
@@ -106,11 +115,10 @@ pub const Schedule = struct {
         return .{ .schedule = self, .interests = storage[0..n], .deadline = self.earliest(), .watch_limit = self.next_watch };
     }
     pub fn wait(self: *const Schedule, descriptors: []std.posix.pollfd, deadline: ?i96) !void {
-        const timeout: i32 = if (deadline) |d| @intCast(std.math.clamp(d -| self.nowMs(), 0, std.math.maxInt(i32))) else -1;
-        try linux.poll(descriptors, timeout);
+        try linux.pollUntil(self.io, descriptors, deadline);
     }
 
-    pub fn watch(self: *Schedule, fd: std.posix.fd_t, interest: enum { read, write, read_write }) !input.Watch {
+    pub fn watch(self: *Schedule, fd: std.posix.fd_t, interest: enum { read, write, read_write }) !Watch {
         if (fd < 0) return error.InvalidDescriptor;
         var index = self.source_count;
         for (self.sources[0..self.source_count], 0..) |source, i| {
@@ -133,7 +141,7 @@ pub const Schedule = struct {
         return @fromBackingInt(source.id);
     }
 
-    pub fn unwatch(self: *Schedule, id: input.Watch) void {
+    pub fn unwatch(self: *Schedule, id: Watch) void {
         for (self.sources[0..self.source_count]) |*source| {
             if (source.id == @backingInt(id)) {
                 source.* = .{};

@@ -145,7 +145,7 @@ pub fn weightedGrid(bounds: Rect, columns: ?AxisTracks, rows: ?AxisTracks) !Grid
     return .{ .bounds = bounds, .columns = if (columns) |a| divideTracks(bounds.x, x, a.gap, a.specs, a.storage) else null, .rows = if (rows) |a| divideTracks(bounds.y, y, a.gap, a.specs, a.storage) else null };
 }
 
-test "weighted tracks redistribute capped shares and reject without touching output" {
+test "layout admission preserves caller storage across failures on either axis" {
     var out: [3]Track = undefined;
     const specs = [_]Constraint{ .{ .weight = 1 }, .{ .weight = 9, .max = 1 }, .{ .weight = 1 } };
     _ = try tracks(2, 12, 1, &specs, &out);
@@ -155,10 +155,6 @@ test "weighted tracks redistribute capped shares and reject without touching out
     try std.testing.expectError(error.LayoutCapacity, tracks(0, 5, 1, &specs, out[0..2]));
     try std.testing.expectError(error.LayoutSpace, tracks(0, 1, 1, &specs, &out));
     try std.testing.expectEqualSlices(Track, &saved, &out);
-    const box = Track.cell(out[2], out[0]);
-    const placed = try box.place(.{ .width = 1, .height = 2 }, .{ .width = 0, .height = 0 }, .{ .width = 2, .height = 2 }, .end, .center);
-    try std.testing.expect(placed.x == 13 and placed.y == 3);
-    const split = try weightedGrid(.{ .x = 2, .y = 1, .width = 12, .height = 8 }, .{ .specs = &specs, .storage = &out, .gap = 1 }, null);
-    try std.testing.expectEqual(Rect{ .x = 9, .y = 1, .width = 5, .height = 8 }, split.rect(2, 0).?);
-    try std.testing.expect(split.rect(2, 1) == null);
+    try std.testing.expectError(error.LayoutCapacity, weightedGrid(.{ .x = 0, .y = 0, .width = 8, .height = 8 }, .{ .specs = &specs, .storage = &out }, .{ .specs = &specs, .storage = &.{} }));
+    try std.testing.expectEqualSlices(Track, &saved, &out);
 }

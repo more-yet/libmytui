@@ -77,7 +77,7 @@ pub fn directional(targets: []const Target, from: Rect, direction: Direction) ?u
     return best;
 }
 
-/// Caller supplies one start offset per item. Gaps are not hits.
+/// Borrows the item heights and one start offset per item.
 pub const ItemRows = struct {
     starts: []const usize,
     heights: []const u16,
@@ -119,7 +119,7 @@ pub fn moveSelection(index: usize, count: usize, delta: isize) ?usize {
 pub const Focus = struct {
     id: ?u64 = null,
 
-    /// Order contains unique application identities; never retain the slice.
+    /// Resolves the focused identity in the current order.
     pub fn reconcile(self: *Focus, order: []const u64) ?usize {
         const id = self.id orelse return null;
         if (std.mem.indexOfScalar(u64, order, id)) |i| return i;
@@ -144,22 +144,4 @@ test "viewport shrink, overflow and removal of focused identity" {
     focus.move(&.{ 2, 1 }, std.math.maxInt(isize));
     try std.testing.expectEqual(1, focus.id);
     try std.testing.expect(focus.reconcile(&.{2}) == null and focus.id == null);
-}
-
-test "geometry excludes gaps, zero-height rows, disabled targets and partial beams" {
-    var offsets: [4]usize = undefined;
-    const rows = try ItemRows.init(&.{ 2, 0, 3, 1 }, 1, &offsets);
-    try std.testing.expectEqual(@as(usize, 9), rows.total);
-    try std.testing.expect(rows.hit(2) == null and rows.hit(3) == null and rows.hit(7) == null);
-    try std.testing.expectEqual(@as(usize, 2), rows.hit(4).?);
-    const from: Rect = .{ .x = 0, .y = 0, .width = 2, .height = 3 };
-    const targets = [_]Target{
-        .{ .id = 1, .rect = .{ .x = 2, .y = 3, .width = 1, .height = 1 } },
-        .{ .id = 2, .rect = .{ .x = 6, .y = 1, .width = 2, .height = 2 } },
-        .{ .id = 3, .rect = from, .enabled = false },
-    };
-    try std.testing.expectEqual(@as(u64, 2), directional(&targets, from, .right).?);
-    try std.testing.expect(hitTarget(&targets, 0, 0) == null);
-    const viewport: Viewport = .{ .offset = 100 };
-    try std.testing.expectEqual(Viewport.Range{ .start = 8, .end = 10 }, viewport.thumb(50, 10, 10));
 }

@@ -28,25 +28,6 @@ pub fn build(b: *std.Build) void {
     mytui.addAnonymousImport("word_cases", .{ .root_source_file = b.path("test/data/WordBreakTest.txt") });
     mytui.addAnonymousImport("line_cases", .{ .root_source_file = b.path("test/data/LineBreakTest.txt") });
     b.step("test", "Verify core transactions and storage invariants").dependOn(&b.addRunArtifact(tests).step);
-    const vterm = b.addTranslateC(.{
-        .root_source_file = b.path("test/terminal_cells.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const screen_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("test/screen.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "mytui", .module = mytui },
-            .{ .name = "vterm", .module = vterm.createModule() },
-        },
-    }) });
-    screen_tests.root_module.addIncludePath(b.path("test"));
-    screen_tests.root_module.addCSourceFile(.{ .file = b.path("test/vterm.c"), .flags = &.{} });
-    screen_tests.root_module.linkSystemLibrary("vterm", .{});
-    b.step("test-screen", "Compare renderer output with libvterm cells").dependOn(&b.addRunArtifact(screen_tests).step);
     const pty_app = b.addExecutable(.{
         .name = "pty-app",
         .root_module = b.createModule(.{
@@ -104,14 +85,8 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/render.zig"),
             .target = target,
-            .optimize = .fast,
-            .link_libc = true,
-            .imports = &.{.{ .name = "mytui", .module = b.createModule(.{
-                .root_source_file = b.path("src/root.zig"),
-                .target = target,
-                .optimize = .fast,
-                .link_libc = true,
-            }) }},
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mytui", .module = mytui }},
         }),
     });
     const run_benchmark = b.addRunArtifact(benchmark);

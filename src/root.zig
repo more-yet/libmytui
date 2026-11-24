@@ -3,10 +3,10 @@ pub const Options = @import("run.zig").Options;
 pub const Action = @import("run.zig").Action;
 pub const Schedule = @import("schedule.zig").Schedule;
 pub const Session = @import("run.zig").Session;
-pub const Watch = @import("input.zig").Watch;
-pub const Timer = @import("input.zig").Timer;
+pub const Watch = @import("schedule.zig").Watch;
+pub const Timer = @import("schedule.zig").Timer;
 pub const Notification = @import("linux.zig").Notification;
-pub const Terminal = @import("linux.zig").Terminal;
+pub const Terminal = @import("terminal.zig").Terminal;
 pub const Reply = @import("input.zig").Reply;
 pub const Mouse = @import("input.zig").Mouse;
 pub const PtyProcess = @import("process.zig").PtyProcess;
@@ -40,7 +40,7 @@ pub const Limits = @import("screen.zig").Limits;
 
 test {
     _ = @import("graphics.zig");
-    _ = @import("linux.zig");
+    _ = Terminal;
     _ = @import("screen.zig");
     _ = @import("input.zig");
     _ = @import("text.zig");

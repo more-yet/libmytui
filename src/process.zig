@@ -16,13 +16,9 @@ pub const PtyProcess = struct {
     pub fn prepareStrings(items: []const []const u8, storage: []u8, pointers: []?[*:0]const u8) !Strings {
         if (pointers.len <= items.len) return error.ArgumentCapacity;
         var used: usize = 0;
-        for (items) |item| {
+        for (items, 0..) |item, i| {
             if (std.mem.indexOfScalar(u8, item, 0) != null) return error.EmbeddedNul;
             if (item.len >= storage.len - used) return error.ArgumentCapacity;
-            used += item.len + 1;
-        }
-        used = 0;
-        for (items, 0..) |item, i| {
             @memcpy(storage[used..][0..item.len], item);
             storage[used + item.len] = 0;
             pointers[i] = storage[used..][0..item.len :0].ptr;
@@ -34,9 +30,7 @@ pub const PtyProcess = struct {
     const Failure = enum(u8) { signals, terminal, descriptors, missing, denied, exec };
 
     pub fn start(path: [*:0]const u8, argv: Strings, env: Strings, size: Size) !PtyProcess {
-        if (argv.len == 0) return error.InvalidArguments;
-        for (argv) |arg| if (arg == null) return error.InvalidArguments;
-        for (env) |entry| if (entry == null) return error.InvalidEnvironment;
+        if (argv.len == 0 or argv[0] == null) return error.InvalidArguments;
         var disposition: linux.Sigaction = undefined;
         if (linux.errno(linux.sigaction(.CHLD, null, &disposition)) != .SUCCESS or
             disposition.handler.handler == linux.SIG.IGN or disposition.flags & linux.SA.NOCLDWAIT != 0)
@@ -229,9 +223,8 @@ pub const PtyProcess = struct {
         var fd = [_]std.posix.pollfd{.{ .fd = self.completion, .events = std.posix.POLL.IN, .revents = 0 }};
         while (true) {
             if (try self.collect()) |status| return status;
-            const remaining = deadline_ms -| tty.now(io);
-            if (remaining <= 0) return error.ChildTimeout;
-            try tty.poll(&fd, @intCast(@min(remaining, std.math.maxInt(i32))));
+            if (tty.now(io) >= deadline_ms) return error.ChildTimeout;
+            try tty.pollUntil(io, &fd, deadline_ms);
         }
     }
 
@@ -254,7 +247,7 @@ test "child startup handshake, waitable exit before drain, explicit environment 
     var proc = try PtyProcess.start("/bin/sh", &.{ "sh", "-c", "stty size; printf '%s' \"$VALUE\"; exit 42" }, &.{ "VALUE=result", "PATH=/usr/bin:/bin" }, size);
     defer proc.deinit() catch unreachable;
     var fds = [_]std.posix.pollfd{.{ .fd = proc.completion, .events = std.posix.POLL.IN, .revents = 0 }};
-    try tty.poll(&fds, 3000);
+    try tty.pollUntil(std.testing.io, &fds, tty.now(std.testing.io) + 3000);
     try std.testing.expect(fds[0].revents & std.posix.POLL.IN != 0);
     try std.testing.expectEqual(@as(u8, 42), (try proc.collect()).?.exited);
     var output: [64]u8 = undefined;
@@ -274,7 +267,7 @@ test "stalled PTY accepts bounded writes and cancellation reaps the child" {
     try proc.resize(.{ .width = 20, .height = 20 });
     var bytes: [4096]u8 = @splat('x');
     var fds = [_]std.posix.pollfd{.{ .fd = proc.master, .events = std.posix.POLL.IN, .revents = 0 }};
-    try tty.poll(&fds, 3000);
+    try tty.pollUntil(std.testing.io, &fds, tty.now(std.testing.io) + 3000);
     try std.testing.expectEqual(1, try proc.read(&bytes));
     try std.testing.expectEqual(@as(u8, '.'), bytes[0]);
     try std.testing.expect(try proc.read(&bytes) == null);
@@ -299,7 +292,7 @@ test "child restores default dispositions and unblocks inherited signals before 
     var proc = try PtyProcess.start("/bin/sh", &.{ "sh", "-c", "kill -PIPE $$; exit 77" }, &.{}, .{ .width = 10, .height = 2 });
     defer proc.deinit() catch unreachable;
     var fds = [_]std.posix.pollfd{.{ .fd = proc.completion, .events = std.posix.POLL.IN, .revents = 0 }};
-    try tty.poll(&fds, 3000);
+    try tty.pollUntil(std.testing.io, &fds, tty.now(std.testing.io) + 3000);
     const status = try proc.collect() orelse return error.ChildStillRunning;
     try std.testing.expectEqual(PtyProcess.Status{ .signaled = .PIPE }, status);
 }
@@ -313,7 +306,7 @@ test "group stop/continue and bounded reap retain the master until descendants r
     defer proc.deinit() catch unreachable;
     defer if (proc.status == null) proc.signalGroup(.KILL) catch {};
     var fd = [_]std.posix.pollfd{.{ .fd = proc.master, .events = std.posix.POLL.IN, .revents = 0 }};
-    try tty.poll(&fd, 3000);
+    try tty.pollUntil(std.testing.io, &fd, tty.now(std.testing.io) + 3000);
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(1, try proc.read(&byte));
     try std.testing.expectError(error.ChildTimeout, proc.waitUntil(io, tty.now(io)));
@@ -331,7 +324,7 @@ test "group stop/continue and bounded reap retain the master until descendants r
     }
     const status = try proc.killAndWait(io, tty.now(io) + 3000, .group);
     try std.testing.expectEqual(linux.SIG.KILL, status.signaled);
-    try tty.poll(&fd, 3000);
+    try tty.pollUntil(std.testing.io, &fd, tty.now(std.testing.io) + 3000);
     try std.testing.expectEqual(0, try proc.read(&byte));
     try std.testing.expectError(error.ChildAlreadyReaped, proc.signalGroup(.KILL));
     proc.closeMaster();

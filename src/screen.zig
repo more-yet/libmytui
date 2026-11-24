@@ -289,35 +289,31 @@ pub const Frame = struct {
     }
 
     pub fn text(self: *Frame, x: u16, y: u16, bytes: []const u8, style: Style) !void {
-        var it = try text_module.Iterator.init(bytes, self.wide_ambiguous);
-        const packed_style = style.pack(self.color_profile);
+        try self.paintLine(x, y, .{ .bytes = bytes, .wide_ambiguous = self.wide_ambiguous }, style, false);
+    }
+
+    /// Draw the first logical row of validated text.
+    pub fn line(self: *Frame, x: u16, y: u16, value: text_module.Text, style: Style) !void {
+        var iterator = value.clusters();
+        iterator.wide_ambiguous = self.wide_ambiguous;
+        try self.paintLine(x, y, iterator, style, true);
+    }
+
+    fn paintLine(self: *Frame, x: u16, y: u16, clusters: text_module.Iterator, style: Style, comptime admitted: bool) !void {
+        var it = clusters;
         if (self.screenPoint(x, y)) |p| {
             var room = self.bounds.width - x;
             var index = @as(usize, p.y) * self.buffer.size.width + p.x;
-            while (try it.checkedNext()) |g| {
-                if (g.width > room) break;
+            const packed_style = style.pack(self.color_profile);
+            while (room > 0) {
+                const g = (if (admitted) it.next() else try it.checkedNext()) orelse return;
+                if (g.width == 0 or g.width > room) break;
                 try self.buffer.put(index, g, packed_style);
                 room -= g.width;
                 index += g.width;
             }
         }
-        while (try it.checkedNext() != null) {}
-    }
-
-    /// Draw the first logical row of validated text.
-    pub fn line(self: *Frame, x: u16, y: u16, value: text_module.Text, style: Style) !void {
-        const p = self.screenPoint(x, y) orelse return;
-        var iterator = value.clusters();
-        iterator.wide_ambiguous = self.wide_ambiguous;
-        var column = x;
-        const packed_style = style.pack(self.color_profile);
-        const row = @as(usize, p.y) * self.buffer.size.width + self.bounds.x;
-        while (column < self.bounds.width) {
-            const cluster = iterator.next() orelse break;
-            if (cluster.width == 0 or cluster.width > self.bounds.width - column) break;
-            try self.buffer.put(row + column, cluster, packed_style);
-            column += cluster.width;
-        }
+        if (!admitted) while (try it.checkedNext() != null) {};
     }
 
     pub fn print(self: *Frame, x: u16, y: u16, comptime format: []const u8, args: anytype, style: Style) !void {
@@ -357,13 +353,13 @@ pub const Renderer = struct {
     owned: ?struct { allocator: std.mem.Allocator, cells: []Cell, clusters: []u8 } = null,
     front: Buffer,
     back: Buffer,
+    size: Size = .{ .width = 0, .height = 0 },
+    wide_ambiguous: bool = false,
     phase: enum { idle, drawing, presenting } = .idle,
     invalid: bool = true,
     synchronized: bool = false,
-    sync_active: bool = false,
     grapheme_mode: bool = true,
     color_profile: ColorProfile = .rgb,
-    frame_sync: bool = false,
     finished: bool = false,
     work_budget: u32 = 4096,
     clear_checkpoint: bool = false,
@@ -383,7 +379,7 @@ pub const Renderer = struct {
         const cells = try allocator.alloc(Cell, n.cells);
         errdefer allocator.free(cells);
         const clusters = try allocator.alloc(u8, n.cluster_bytes);
-        var r = initStorage(limits, cells, clusters) catch unreachable;
+        var r = splitGrids(cells, clusters);
         r.owned = .{ .allocator = allocator, .cells = cells, .clusters = clusters };
         return r;
     }
@@ -394,7 +390,13 @@ pub const Renderer = struct {
     pub fn initStorage(limits: Limits, cells: []Cell, clusters: []u8) !Renderer {
         const n = try storageSize(limits);
         if (cells.len < n.cells or clusters.len < n.cluster_bytes) return error.RendererCapacity;
-        return .{ .front = .{ .cells = cells[0..limits.max_cells], .clusters = clusters[0..limits.cluster_bytes] }, .back = .{ .cells = cells[limits.max_cells..n.cells], .clusters = clusters[limits.cluster_bytes..n.cluster_bytes] } };
+        return splitGrids(cells[0..n.cells], clusters[0..n.cluster_bytes]);
+    }
+    fn splitGrids(cells: []Cell, clusters: []u8) Renderer {
+        return .{
+            .front = .{ .cells = cells[0 .. cells.len / 2], .clusters = clusters[0 .. clusters.len / 2] },
+            .back = .{ .cells = cells[cells.len / 2 ..], .clusters = clusters[clusters.len / 2 ..] },
+        };
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -405,9 +407,15 @@ pub const Renderer = struct {
         self.* = undefined;
     }
 
-    pub fn begin(self: *Renderer, size: Size, wide_ambiguous: bool) !Frame {
-        std.debug.assert(self.phase == .idle);
+    /// Set the dimensions for the next draw; submitted grids retain their size.
+    pub fn resize(self: *Renderer, size: Size) !void {
         if (size.count() > self.back.cells.len) return error.ScreenCapacity;
+        self.size = size;
+    }
+
+    pub fn begin(self: *Renderer) Frame {
+        std.debug.assert(self.phase == .idle);
+        const size = self.size;
         self.back.size = size;
         self.back.used = 0;
         self.back.caret = null;
@@ -416,7 +424,7 @@ pub const Renderer = struct {
         return .{
             .buffer = &self.back,
             .bounds = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
-            .wide_ambiguous = wide_ambiguous,
+            .wide_ambiguous = self.wide_ambiguous,
             .color_profile = self.color_profile,
         };
     }
@@ -425,7 +433,6 @@ pub const Renderer = struct {
         std.debug.assert(self.phase == .drawing);
         if (!std.meta.eql(self.front.size, self.back.size)) self.invalid = true;
         self.phase = .presenting;
-        self.frame_sync = self.synchronized;
         self.finished = false;
         self.stats = .{};
         self.cancelling = false;
@@ -456,7 +463,7 @@ pub const Renderer = struct {
         std.debug.assert(self.phase == .presenting);
         if (self.accepted < self.output_len) return .{ .output = self.output[self.accepted..self.output_len] };
         if (self.cancelling) {
-            if (self.sync_active) {
+            if (self.synchronized and self.stats.bytes != 0 and !self.finished) {
                 const close = "\x1b[?2026l";
                 @memcpy(self.output[0..close.len], close);
                 self.accepted = 0;
@@ -475,7 +482,7 @@ pub const Renderer = struct {
         }
         const sync_on = "\x1b[?2026h";
         const emitted = self.stats.bytes != 0;
-        const prefix: []const u8 = if (emitted) "" else if (self.frame_sync) sync_on else if (self.front.caret != null) "\x1b[?25l" else "";
+        const prefix: []const u8 = if (emitted) "" else if (self.synchronized) sync_on else if (self.front.caret != null) "\x1b[?25l" else "";
         var writer = std.Io.Writer.fixed(self.output[prefix.len..]);
         if (self.invalid and !emitted) {
             writer.writeAll("\x1b[0m\x1b[2J") catch unreachable;
@@ -538,7 +545,7 @@ pub const Renderer = struct {
             if (self.back.caret) |caret| {
                 if (changed or emitted or writer.buffered().len != 0) writer.print("\x1b[{d};{d}H\x1b[{d} q\x1b[?25h", .{ @as(u32, caret.y) + 1, @as(u32, caret.x) + 1, @backingInt(caret.shape) }) catch unreachable;
             } else if (changed) writer.writeAll("\x1b[?25l") catch unreachable;
-            if (self.frame_sync and (emitted or writer.buffered().len != 0)) writer.writeAll("\x1b[?2026l") catch unreachable;
+            if (self.synchronized and (emitted or writer.buffered().len != 0)) writer.writeAll("\x1b[?2026l") catch unreachable;
             self.finished = true;
         }
         self.accepted = 0;
@@ -562,7 +569,6 @@ pub const Renderer = struct {
         std.debug.assert(self.phase == .presenting and count <= self.output_len - self.accepted);
         self.accepted += count;
         self.stats.bytes += count;
-        if (self.frame_sync and self.stats.bytes >= "\x1b[?2026h".len) self.sync_active = !(self.finished and self.accepted == self.output_len);
     }
 
     fn equal(self: *const Renderer, index: usize) bool {
@@ -589,7 +595,8 @@ test "styled graphemes and clipped drawing share layout in borrowed grids" {
     var arena: [128]u8 = undefined;
     var r = try Renderer.initStorage(.{ .max_cells = 12, .cluster_bytes = 64 }, &cells, &arena);
     defer r.deinit();
-    var f = try r.begin(.{ .width = 4, .height = 3 }, false);
+    try r.resize(.{ .width = 4, .height = 3 });
+    var f = r.begin();
     const t = try Text.init("e\u{301}界z", .{});
     try std.testing.expectError(error.InvalidSpan, StyledText.init(t, &.{.{ .end = 1, .style = .{} }}));
     const s = try StyledText.init(t, &.{ .{ .end = 3, .style = .{ .strike = true } }, .{ .end = t.bytes.len, .style = .{ .blink = true } } });
@@ -612,7 +619,8 @@ test "cancellation preserves exposed output, closes synchronized frame and force
     r.synchronized = true;
     r.work_budget = 2;
     r.clear_checkpoint = true;
-    var f = try r.begin(.{ .width = 8, .height = 1 }, false);
+    try r.resize(.{ .width = 8, .height = 1 });
+    var f = r.begin();
     try f.fillAscii('x', .{});
     r.submit();
     const clear = r.step().output;
@@ -658,8 +666,9 @@ test "caret-only frames and synchronization commit on final acknowledgment" {
     r.synchronized = true;
     r.color_profile = .ansi16;
     const size: Size = .{ .width = 8, .height = 1 };
+    try r.resize(size);
     for (0..4) |i| {
-        var frame = try r.begin(size, false);
+        var frame = r.begin();
         try frame.text(0, 0, "x", .{ .foreground = .{ .rgb = 0xff0000 } });
         const region = frame.region(.{ .x = 2, .y = 0, .width = 3, .height = 1 });
         region.setCaret(.{ .x = if (i == 0) 0 else 1, .y = 0, .shape = .blinking_bar });
@@ -688,7 +697,8 @@ test "failed drawing and cancelled resize preserve the committed frame and repai
     var renderer = try Renderer.init(std.testing.allocator, .{ .max_cells = 8, .cluster_bytes = 0 });
     defer renderer.deinit();
     const size: Size = .{ .width = 8, .height = 1 };
-    var frame = try renderer.begin(size, false);
+    try renderer.resize(size);
+    var frame = renderer.begin();
     try frame.text(0, 0, "界", .{});
     renderer.submit();
     while (true) switch (renderer.step()) {
@@ -696,16 +706,19 @@ test "failed drawing and cancelled resize preserve the committed frame and repai
         .yielded, .cleared => {},
         .complete => break,
     };
-    frame = try renderer.begin(size, false);
+    frame = renderer.begin();
     try frame.text(0, 0, "界", .{});
     try std.testing.expectError(error.FrameTextCapacity, frame.text(1, 0, "e\u{301}", .{}));
     try std.testing.expectEqual(@as(u2, 2), renderer.back.cells[0].width);
     try std.testing.expectEqual(@as(u2, 0), renderer.back.cells[1].width);
     renderer.cancelDraw();
     try std.testing.expectEqual(@as(u32, '界'), renderer.front.cells[0].glyph);
-    _ = try renderer.begin(.{ .width = 4, .height = 1 }, false);
+    try renderer.resize(.{ .width = 4, .height = 1 });
+    _ = renderer.begin();
     renderer.cancelDraw();
-    frame = try renderer.begin(size, false);
+    try renderer.resize(size);
+    try std.testing.expectError(error.ScreenCapacity, renderer.resize(.{ .width = 9, .height = 1 }));
+    frame = renderer.begin();
     try frame.text(0, 0, "界", .{});
     renderer.submit();
     try std.testing.expect(renderer.step() == .complete);
@@ -721,7 +734,8 @@ test "resized frames keep committed storage stable across output batches and par
         .{ .width = 40, .height = 32 },
     };
     for (sizes) |size| {
-        var frame = try renderer.begin(size, false);
+        try renderer.resize(size);
+        var frame = renderer.begin();
         for (0..size.height) |y| {
             for (0..size.width) |x| {
                 try frame.text(@intCast(x), @intCast(y), "e\u{301}", .{

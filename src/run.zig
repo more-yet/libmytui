@@ -2,29 +2,34 @@ const std = @import("std");
 const screen = @import("screen.zig");
 const input = @import("input.zig");
 const linux = @import("linux.zig");
-const Sender = @import("graphics/sender.zig").Sender;
+const Terminal = @import("terminal.zig").Terminal;
+const Sender = @import("graphics.zig").Sender;
+const Schedule = @import("schedule.zig").Schedule;
 
 pub const Action = enum { none, redraw, repaint, cancel_paste, @"suspend", quit };
 
-const Schedule = @import("schedule.zig").Schedule;
-
 pub const Session = struct {
     schedule: Schedule,
-    capabilities: *const linux.Terminal.Capabilities,
-    keyboard: *linux.Terminal.Keyboard,
+    capabilities: *const Terminal.Capabilities,
+    keyboard: *Terminal.Keyboard,
     last_frame: screen.Renderer.Stats = .{},
     matched_reply: bool = false,
+};
+
+const Loop = struct {
+    session: Session,
+    parser: input.Parser,
     phase: enum { running, suspending, quitting } = .running,
     draw: enum { clean, dirty, repaint } = .repaint,
 
-    fn dispatch(self: *Session, app: anytype, event: input.Event, parser: *input.Parser) !void {
+    fn dispatch(self: *Loop, app: anytype, event: input.Event) !void {
         switch (try app.update(event)) {
             .none => {},
             .redraw => if (self.draw == .clean) {
                 self.draw = .dirty;
             },
             .repaint => self.draw = .repaint,
-            .cancel_paste => parser.cancelPaste(),
+            .cancel_paste => self.parser.cancelPaste(),
             .@"suspend" => self.phase = .suspending,
             .quit => self.phase = .quitting,
         }
@@ -34,10 +39,10 @@ pub const Session = struct {
 pub const Options = struct {
     graphics_sender: ?*Sender = null,
     terminal_fd: ?std.posix.fd_t = null,
-    entry: linux.Terminal.Entry = .{},
-    keyboard: linux.Terminal.Keyboard = .{},
+    entry: Terminal.Entry = .{},
+    keyboard: Terminal.Keyboard = .{},
     raw_replies: bool = false,
-    protocols: linux.Terminal.Protocols = .{},
+    protocols: Terminal.Protocols = .{},
     color_profile: screen.ColorProfile = .rgb,
     limits: screen.Limits = .{},
     work_budget: u32 = 4096,
@@ -62,6 +67,7 @@ pub fn run(init: std.process.Init, app: anytype, options: Options) !void {
     var renderer = try screen.Renderer.init(init.gpa, options.limits);
     defer renderer.deinit();
     renderer.color_profile = options.color_profile;
+    renderer.wide_ambiguous = options.wide_ambiguous;
     renderer.clear_checkpoint = options.graphics_sender != null;
     renderer.work_budget = options.work_budget;
     renderer.grapheme_mode = options.entry.grapheme;
@@ -73,52 +79,50 @@ pub fn run(init: std.process.Init, app: anytype, options: Options) !void {
     defer init.gpa.free(timers);
     const descriptors = try init.gpa.alloc(std.posix.pollfd, sources.len + 2);
     defer init.gpa.free(descriptors);
-    var parser = if (options.streamed_paste) try input.Parser.initStreamed(paste) else input.Parser.init(paste);
-    var terminal = if (options.terminal_fd) |fd| try linux.Terminal.borrow(init.io, fd, options.alternate_screen, options.shutdown_ms, true) else try linux.Terminal.open(init.io, options.alternate_screen, options.shutdown_ms);
+    var terminal = if (options.terminal_fd) |fd| try Terminal.borrow(init.io, fd, options.alternate_screen, options.shutdown_ms, true) else try Terminal.open(init.io, options.alternate_screen, options.shutdown_ms);
     defer terminal.deinit();
     terminal.protocols = options.protocols;
     terminal.entry = options.entry;
     terminal.frame_cursor = true;
     terminal.desired_keys = options.keyboard;
-    parser.raw_replies = options.raw_replies;
-    var session: Session = .{ .schedule = Schedule.init(init.io, sources, timers), .capabilities = &terminal.capabilities, .keyboard = &terminal.desired_keys };
-    var size = (try terminal.size()) orelse @import("geometry.zig").Size{ .width = 80, .height = 24 };
-    if (size.count() > options.limits.max_cells) return error.ScreenCapacity;
+    var loop: Loop = .{
+        .parser = if (options.streamed_paste) try input.Parser.initStreamed(paste) else input.Parser.init(paste),
+        .session = .{ .schedule = Schedule.init(init.io, sources, timers), .capabilities = &terminal.capabilities, .keyboard = &terminal.desired_keys },
+    };
+    loop.parser.raw_replies = options.raw_replies;
+    const session = &loop.session;
+    try renderer.resize((try terminal.size()) orelse .{ .width = 80, .height = 24 });
     try terminal.enter();
 
     {
         defer if (has_lifecycle) app.stop();
-        if (has_lifecycle) try app.start(&session);
-        var output_blocked = false;
-        var sending = false;
+        if (has_lifecycle) try app.start(session);
+        var output: enum { ready, blocked, idle } = .ready;
+        var transfer: ?*Sender = null;
         var stop_deadline: ?i96 = null;
         var input_deadline: ?i96 = null;
         var bytes: [4096]u8 = undefined;
         while (true) {
             var check_size = false;
-            if (session.phase != .running and renderer.phase == .idle and !sending) {
-                if (session.phase == .quitting) break;
+            if (loop.phase != .running and renderer.phase == .idle and transfer == null) {
+                if (loop.phase == .quitting) break;
                 try terminal.suspendProcess();
-                output_blocked = false;
-                const interrupted_paste = parser.streamed and parser.state == .paste;
-                _ = parser.finish();
+                output = .ready;
                 input_deadline = null;
                 stop_deadline = null;
-                session.phase = .running;
+                loop.phase = .running;
                 check_size = true;
-                session.draw = .repaint;
-                if (interrupted_paste) try session.dispatch(app, .{ .paste_end = .{ .status = .cancelled } }, &parser);
+                loop.draw = .repaint;
+                if (loop.parser.finish()) |event| {
+                    if (event == .paste_end) try loop.dispatch(app, .{ .paste_end = .{ .status = .cancelled } });
+                }
             }
             const current = linux.now(init.io);
             if (stop_deadline) |deadline| {
                 if (current >= deadline) return error.OutputTimeout;
             }
-            var turn: Schedule.Turn = if (session.phase == .running) try session.schedule.prepare(descriptors[2..]) else .{ .schedule = &session.schedule };
-            var wake: ?i96 = if (switch (renderer.phase) {
-                .idle => !output_blocked and (session.draw != .clean or (options.graphics_sender != null and options.graphics_sender.?.isActive()) or terminal.modeOutput().len != 0),
-                .presenting => !output_blocked,
-                .drawing => unreachable,
-            }) current else null;
+            var turn: Schedule.Turn = if (loop.phase == .running) try session.schedule.prepare(descriptors[2..]) else .{ .schedule = &session.schedule };
+            var wake: ?i96 = if (output == .ready) current else null;
             for ([_]?i96{ input_deadline, turn.deadline, stop_deadline }) |maybe| {
                 if (maybe) |deadline| {
                     wake = @min(wake orelse deadline, deadline);
@@ -126,8 +130,8 @@ pub fn run(init: std.process.Init, app: anytype, options: Options) !void {
             }
             descriptors[0] = .{
                 .fd = terminal.fd,
-                .events = (if (session.phase == .running) std.posix.POLL.IN else @as(i16, 0)) |
-                    (if (output_blocked) @as(i16, std.posix.POLL.OUT) else 0),
+                .events = (if (loop.phase == .running) std.posix.POLL.IN else @as(i16, 0)) |
+                    (if (output == .blocked) @as(i16, std.posix.POLL.OUT) else 0),
                 .revents = 0,
             };
             descriptors[1] = .{ .fd = terminal.signal_fd, .events = std.posix.POLL.IN, .revents = 0 };
@@ -137,60 +141,59 @@ pub fn run(init: std.process.Init, app: anytype, options: Options) !void {
                 if (try linux.read(terminal.signal_fd, std.mem.sliceAsBytes(&records))) |count| {
                     for (records[0 .. count / @sizeOf(std.os.linux.signalfd_siginfo)]) |record| {
                         switch (record.signo) {
-                            @backingInt(std.posix.SIG.INT), @backingInt(std.posix.SIG.TERM) => session.phase = .quitting,
-                            @backingInt(std.posix.SIG.TSTP) => if (session.phase != .quitting) {
-                                session.phase = .suspending;
+                            @backingInt(std.posix.SIG.INT), @backingInt(std.posix.SIG.TERM) => loop.phase = .quitting,
+                            @backingInt(std.posix.SIG.TSTP) => if (loop.phase != .quitting) {
+                                loop.phase = .suspending;
                             },
                             @backingInt(std.posix.SIG.WINCH), @backingInt(std.posix.SIG.CONT) => {
                                 check_size = true;
-                                if (record.signo == @backingInt(std.posix.SIG.CONT)) session.draw = .repaint;
+                                if (record.signo == @backingInt(std.posix.SIG.CONT)) loop.draw = .repaint;
                             },
                             else => {},
                         }
                     }
                 }
             }
-            if (descriptors[0].revents & std.posix.POLL.OUT != 0) output_blocked = false;
+            if (descriptors[0].revents & std.posix.POLL.OUT != 0) output = .ready;
             if (descriptors[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0 and descriptors[0].revents & std.posix.POLL.IN == 0) {
-                if (session.phase == .running) {
-                    if (parser.finish()) |event| try session.dispatch(app, event, &parser);
+                if (loop.phase == .running) {
+                    if (loop.parser.finish()) |event| try loop.dispatch(app, event);
                 }
-                session.phase = .quitting;
-                output_blocked = false;
+                loop.phase = .quitting;
+                output = .ready;
             }
-            if (check_size and session.phase == .running) {
+            if (check_size and loop.phase == .running) {
                 if (try terminal.size()) |resized| {
-                    if (resized.count() > options.limits.max_cells) return error.ScreenCapacity;
-                    if (!std.meta.eql(size, resized)) {
-                        size = resized;
-                        session.draw = .repaint;
-                        try session.dispatch(app, .{ .resize = size }, &parser);
+                    if (!std.meta.eql(renderer.size, resized)) {
+                        try renderer.resize(resized);
+                        loop.draw = .repaint;
+                        try loop.dispatch(app, .{ .resize = resized });
                     }
                 }
             }
-            if (session.phase == .running) {
+            if (loop.phase == .running) {
                 if (input_deadline) |deadline| {
                     if (linux.now(init.io) >= deadline) {
                         input_deadline = null;
-                        if (parser.expire()) |event| try session.dispatch(app, event, &parser);
+                        if (loop.parser.expire()) |event| try loop.dispatch(app, event);
                     }
                 }
             }
-            if (session.phase == .running and descriptors[0].revents & std.posix.POLL.IN != 0) {
+            if (loop.phase == .running and descriptors[0].revents & std.posix.POLL.IN != 0) {
                 if (try linux.read(terminal.fd, &bytes)) |count| {
                     if (count == 0) {
-                        if (parser.finish()) |event| try session.dispatch(app, event, &parser);
-                        session.phase = .quitting;
+                        if (loop.parser.finish()) |event| try loop.dispatch(app, event);
+                        loop.phase = .quitting;
                     }
                     for (bytes[0..count]) |byte| {
-                        if (parser.feed(byte)) |event| {
+                        if (loop.parser.feed(byte)) |event| {
                             session.matched_reply = event == .reply and terminal.observe(event.reply);
-                            try session.dispatch(app, event, &parser);
+                            try loop.dispatch(app, event);
                             session.matched_reply = false;
                         }
-                        if (session.phase != .running) break;
+                        if (loop.phase != .running) break;
                     }
-                    input_deadline = if (parser.timeoutKind()) |kind|
+                    input_deadline = if (loop.parser.timeoutKind()) |kind|
                         linux.now(init.io) + switch (kind) {
                             .escape => options.escape_ms,
                             .sequence => options.sequence_ms,
@@ -199,67 +202,69 @@ pub fn run(init: std.process.Init, app: anytype, options: Options) !void {
                         null;
                 }
             }
-            while (session.phase == .running) {
-                const event = turn.nextReady() orelse break;
-                try session.dispatch(app, event, &parser);
+            while (loop.phase == .running) {
+                const ready = turn.nextReady() orelse break;
+                try loop.dispatch(app, .{ .ready = ready });
             }
-            if (session.phase == .running) {
+            if (loop.phase == .running) {
                 turn.beginTimers(session.schedule.nowMs());
                 while (turn.nextTimer()) |id| {
-                    try session.dispatch(app, .{ .timer = id }, &parser);
-                    if (session.phase != .running) break;
+                    try loop.dispatch(app, .{ .timer = id });
+                    if (loop.phase != .running) break;
                 }
             }
-            if (session.phase != .running) {
+            if (loop.phase != .running) {
                 input_deadline = null;
                 if (stop_deadline == null) stop_deadline = linux.now(init.io) + options.shutdown_ms;
             }
-            if (output_blocked) continue;
-            if (session.phase == .running and renderer.phase == .idle and !sending) {
+            if (output == .blocked) continue;
+            output = .ready;
+            if (renderer.phase == .idle and transfer == null) {
+                if (loop.phase != .running) continue;
                 const command = terminal.modeOutput();
                 if (command.len != 0) {
-                    if (try linux.write(terminal.fd, command)) |n| terminal.consumeMode(n) else output_blocked = true;
+                    if (try linux.write(terminal.fd, command)) |n| terminal.consumeMode(n) else output = .blocked;
                     continue;
                 }
-                renderer.synchronized = terminal.sync_frames;
-            }
-            if (options.graphics_sender) |sender| {
-                if (sending or (session.phase == .running and renderer.phase == .idle and sender.isActive())) {
-                    sending = true;
-                    const output = sender.outputStep().?;
-                    if (try linux.write(terminal.fd, output)) |n| sender.consumeOutput(n) else output_blocked = true;
-                    if (!sender.isActive()) {
-                        sending = false;
-                        if (session.phase == .running) {
-                            try session.dispatch(app, .graphics_sent, &parser);
-                            sending = session.phase == .running and renderer.phase == .presenting and sender.isActive();
-                        }
+                if (options.graphics_sender) |sender| {
+                    if (sender.isActive()) transfer = sender;
+                }
+                if (transfer == null) {
+                    if (loop.draw == .clean) {
+                        output = .idle;
+                        continue;
                     }
-                    continue;
+                    if (loop.draw == .repaint) renderer.invalidate();
+                    renderer.synchronized = terminal.sync_frames;
+                    var frame = renderer.begin();
+                    try app.draw(&frame);
+                    renderer.submit();
+                    loop.draw = .clean;
                 }
             }
-            if (session.phase == .running and renderer.phase == .idle) {
-                if (session.draw == .clean) continue;
-                if (session.draw == .repaint) renderer.invalidate();
-                var frame = try renderer.begin(size, options.wide_ambiguous);
-                try app.draw(&frame);
-                renderer.submit();
-                session.draw = .clean;
+            if (transfer) |sender| {
+                if (try linux.write(terminal.fd, sender.outputStep().?)) |n| sender.consumeOutput(n) else output = .blocked;
+                if (!sender.isActive()) {
+                    transfer = null;
+                    if (loop.phase == .running) {
+                        try loop.dispatch(app, .graphics_sent);
+                        if (loop.phase == .running and renderer.phase == .presenting and sender.isActive()) transfer = sender;
+                    }
+                }
+                continue;
             }
-            if (renderer.phase == .presenting) switch (renderer.step()) {
-                .output => |output| {
-                    if (try linux.write(terminal.fd, output)) |count| {
-                        renderer.consume(count);
-                        terminal.sync_active = renderer.sync_active;
-                    } else output_blocked = true;
+            switch (renderer.step()) {
+                .output => |chunk| {
+                    if (try linux.write(terminal.fd, chunk)) |count| renderer.consume(count) else output = .blocked;
                 },
                 .yielded => {},
-                .cleared => if (session.phase == .running) {
-                    try session.dispatch(app, .screen_clear, &parser);
-                    sending = session.phase == .running and options.graphics_sender.?.isActive();
+                .cleared => if (loop.phase == .running) {
+                    try loop.dispatch(app, .screen_clear);
+                    const sender = options.graphics_sender.?;
+                    if (loop.phase == .running and sender.isActive()) transfer = sender;
                 },
                 .complete => session.last_frame = renderer.stats,
-            };
+            }
         }
     }
     try terminal.leave();

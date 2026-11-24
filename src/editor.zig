@@ -43,18 +43,19 @@ pub const Editor = struct {
         const storage = try allocator.alloc(u8, try storageBytes(options));
         errdefer allocator.free(storage);
         const slots = try allocator.alloc(Record, recordCount(options));
-        var editor = initStorage(storage, slots, options) catch unreachable;
-        editor.allocator = allocator;
-        return editor;
+        return fromStorage(allocator, storage, slots, options);
     }
 
     pub fn initStorage(bytes: []u8, history: []Record, options: Options) !Editor {
         const count = recordCount(options);
         const need = try storageBytes(options);
         if (history.len < count or bytes.len < need) return error.EditorCapacity;
-        const storage = bytes[0..need];
+        return fromStorage(null, bytes[0..need], history[0..count], options);
+    }
+
+    fn fromStorage(allocator: ?std.mem.Allocator, storage: []u8, records: []Record, options: Options) Editor {
         const n: usize = options.capacity;
-        return .{ .storage = storage, .records = history[0..count], .live = storage[0..n], .stage = storage[n..][0..n], .journal = storage[n * 2 ..], .transaction_limit = options.history, .multiline = options.multiline, .wide_ambiguous = options.wide_ambiguous };
+        return .{ .allocator = allocator, .storage = storage, .records = records, .live = storage[0..n], .stage = storage[n..][0..n], .journal = storage[n * 2 ..], .transaction_limit = options.history, .multiline = options.multiline, .wide_ambiguous = options.wide_ambiguous };
     }
 
     pub fn clear(self: *Editor) void {
@@ -186,7 +187,6 @@ pub const Editor = struct {
         }
         const len = pos + (old.len - end);
         @memcpy(self.stage[pos..len], old[end..]);
-        if (!std.unicode.utf8ValidateSlice(self.stage[start..pos])) return error.InvalidUtf8;
         // A join can change every subsequent RI pair, but never crosses LF.
         const first = if (std.mem.lastIndexOfScalar(u8, old[0..start], '\n')) |lf| lf + 1 else 0;
         const limit_end = pos + (std.mem.indexOfScalar(u8, old[end..], '\n') orelse (old.len - end));
@@ -195,46 +195,47 @@ pub const Editor = struct {
         while (try scan.checkedNext()) |g| {
             if (scan.offset - g.bytes.len < pos and scan.offset >= pos) cursor = scan.offset;
         }
-        const after: Selection = .{ .cursor = cursor, .anchor = cursor };
-        if (self.transaction_limit != 0) {
-            const fresh = self.group_depth == 0 or !self.group_written;
-            const need = (end - start) + (pos - start);
-            if (need > self.journal.len or self.records.len == 0) return error.HistoryCapacity;
-            const used = if (self.index == 0) 0 else blk: {
-                const r = self.records[self.index - 1];
-                break :blk r.payload + r.removed + r.inserted;
-            };
-            var drop: usize = 0;
-            var skip: usize = 0;
-            var groups = self.applied_transactions + @intFromBool(fresh);
-            while (self.index - drop >= self.records.len or used - skip > self.journal.len - need or groups > self.transaction_limit) {
-                if (!fresh and groups == 1) return error.HistoryCapacity;
-                while (true) {
-                    const r = self.records[drop];
-                    skip = r.payload + r.removed + r.inserted;
-                    drop += 1;
-                    if (drop == self.index or self.records[drop].first) break;
-                }
-                groups -= 1;
-            }
-            if (drop != 0) {
-                @memmove(self.records[0 .. self.index - drop], self.records[drop..self.index]);
-                self.index -= drop;
-                for (self.records[0..self.index]) |*r| r.payload -= skip;
-                @memmove(self.journal[0 .. used - skip], self.journal[skip..used]);
-            }
-            const at = used - skip;
-            @memcpy(self.journal[at..][0 .. end - start], old[start..end]);
-            @memcpy(self.journal[at + (end - start) ..][0 .. pos - start], self.stage[start..pos]);
-            self.records[self.index] = .{ .start = start, .payload = at, .removed = end - start, .inserted = pos - start, .before = self.selected, .cursor = cursor, .first = fresh };
-            self.index += 1;
-            self.last = self.index;
-            self.applied_transactions = groups;
-            self.group_written = self.group_depth != 0;
-        }
+        if (self.transaction_limit != 0) try self.recordEdit(start, old[start..end], self.stage[start..pos], cursor);
         std.mem.swap([]u8, &self.live, &self.stage);
         self.len = len;
-        self.selected = after;
+        self.selected = .{ .cursor = cursor, .anchor = cursor };
+    }
+
+    fn recordEdit(self: *Editor, start: usize, removed: []const u8, inserted: []const u8, cursor: usize) !void {
+        const fresh = self.group_depth == 0 or !self.group_written;
+        const need = removed.len + inserted.len;
+        if (need > self.journal.len or self.records.len == 0) return error.HistoryCapacity;
+        const used = if (self.index == 0) 0 else blk: {
+            const r = self.records[self.index - 1];
+            break :blk r.payload + r.removed + r.inserted;
+        };
+        var drop: usize = 0;
+        var skip: usize = 0;
+        var groups = self.applied_transactions + @intFromBool(fresh);
+        while (self.index - drop >= self.records.len or used - skip > self.journal.len - need or groups > self.transaction_limit) {
+            if (!fresh and groups == 1) return error.HistoryCapacity;
+            while (true) {
+                const r = self.records[drop];
+                skip = r.payload + r.removed + r.inserted;
+                drop += 1;
+                if (drop == self.index or self.records[drop].first) break;
+            }
+            groups -= 1;
+        }
+        if (drop != 0) {
+            @memmove(self.records[0 .. self.index - drop], self.records[drop..self.index]);
+            self.index -= drop;
+            for (self.records[0..self.index]) |*r| r.payload -= skip;
+            @memmove(self.journal[0 .. used - skip], self.journal[skip..used]);
+        }
+        const at = used - skip;
+        @memcpy(self.journal[at..][0..removed.len], removed);
+        @memcpy(self.journal[at + removed.len ..][0..inserted.len], inserted);
+        self.records[self.index] = .{ .start = start, .payload = at, .removed = removed.len, .inserted = inserted.len, .before = self.selected, .cursor = cursor, .first = fresh };
+        self.index += 1;
+        self.last = self.index;
+        self.applied_transactions = groups;
+        self.group_written = self.group_depth != 0;
     }
 
     pub fn beginGroup(self: *Editor) void {
@@ -367,29 +368,6 @@ pub const WrappedView = struct {
         return rows;
     }
 };
-
-test "word edits and indexed hit testing agree with scanned wrapped rows" {
-    var e = try Editor.init(std.testing.allocator, .{ .capacity = 64, .history = 2, .multiline = true });
-    defer e.deinit();
-    try e.replace("say can't 一二\n");
-    e.moveWord(.backward, true);
-    try e.deleteWord(.forward);
-    try std.testing.expect(e.undo());
-    try e.select(4, 4);
-    e.moveWord(.forward, true);
-    try std.testing.expectEqualStrings("can't", e.selectedText());
-    var buf: [32]Text.Row = undefined;
-    for ([_]Text.Wrap{ .grapheme, .word }) |mode| {
-        const t = e.text();
-        const index = try t.indexRows(4, mode, &buf);
-        for (0..index.entries.len + 1) |row| for (0..7) |column| {
-            const p: text_module.Position = .{ .row = row, .column = column };
-            const hit = index.hit(p);
-            try std.testing.expectEqual(t.visualHit(4, mode, p), hit);
-            try std.testing.expectEqual(t.visualPosition(4, mode, hit), index.position(hit));
-        };
-    }
-}
 
 test "atomic joining edits, normalized paste, grouped history and eviction" {
     var e = try Editor.init(std.testing.allocator, .{ .capacity = 16, .history = 2, .multiline = true });

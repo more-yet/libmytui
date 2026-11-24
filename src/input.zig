@@ -75,9 +75,6 @@ pub const Key = struct {
     }
 };
 
-pub const Watch = enum(u64) { _ };
-pub const Timer = enum(u64) { _ };
-
 pub const Event = union(enum) {
     key: Key,
     mouse: Mouse,
@@ -89,14 +86,8 @@ pub const Event = union(enum) {
     paste_end: struct { status: enum { complete, cancelled, invalid, truncated }, tail: []const u8 = "" },
     malformed: enum { utf8, paste, incomplete },
     resize: Size,
-    timer: Timer,
-    ready: struct {
-        watch: Watch,
-        readable: bool,
-        writable: bool,
-        hangup: bool,
-        failed: bool,
-    },
+    timer: @import("schedule.zig").Timer,
+    ready: @import("schedule.zig").Ready,
     input_overflow,
     screen_clear,
     graphics_sent,
@@ -148,7 +139,7 @@ pub const OwnedEvent = struct {
 };
 
 pub const Parser = struct {
-    pub const State = enum { ground, escape, escape_intermediate, utf8, csi, discard_csi, ss3, string, string_escape, mouse_bytes, paste };
+    pub const State = enum { ground, escape, escape_intermediate, utf8, csi, discard_csi, ss3, string, string_escape, discard_mouse, paste };
     const paste_end = "\x1b[201~";
 
     state: State = .ground,
@@ -165,7 +156,6 @@ pub const Parser = struct {
     paste_overflow: bool = false,
     streamed: bool = false,
     paste_status: @FieldType(@FieldType(Event, "paste_end"), "status") = .complete,
-    malformed_utf8: usize = 0,
     raw_replies: bool = false,
     raw: [260]u8 = undefined,
     raw_len: usize = 0,
@@ -194,15 +184,6 @@ pub const Parser = struct {
             else => .{ .malformed = .incomplete },
         };
     }
-    pub fn buffered(self: *const Parser) struct { state: State, bytes: usize, terminator_prefix: usize } {
-        return .{ .state = self.state, .bytes = switch (self.state) {
-            .paste => self.paste_len,
-            .csi, .ss3, .utf8, .mouse_bytes => self.len,
-            .string, .string_escape => if (self.apc) self.len else 0,
-            else => 0,
-        }, .terminator_prefix = if (self.state == .paste) self.paste_match else 0 };
-    }
-
     pub fn timeoutKind(self: *const Parser) ?enum { escape, sequence } {
         return switch (self.state) {
             .escape => .escape,
@@ -220,7 +201,6 @@ pub const Parser = struct {
             .csi, .ss3 => self.state = .discard_csi,
             .utf8 => {
                 self.state = .ground;
-                self.malformed_utf8 +|= 1;
                 return .{ .malformed = .utf8 };
             },
             else => {},
@@ -248,7 +228,7 @@ pub const Parser = struct {
             return null;
         }
         if (byte == 0x1b) switch (self.state) {
-            .paste, .string, .string_escape, .mouse_bytes => {},
+            .paste, .string, .string_escape, .discard_mouse => {},
             else => {
                 self.state = .escape;
                 return null;
@@ -303,14 +283,9 @@ pub const Parser = struct {
                 }
                 return null;
             },
-            .mouse_bytes => {
-                self.sequence[self.len] = byte;
+            .discard_mouse => {
                 self.len += 1;
-                if (self.len == 3) {
-                    self.state = .ground;
-                    if (self.sequence[0] < 32 or self.sequence[1] <= 32 or self.sequence[2] <= 32) return null;
-                    return mouseReport(self.sequence[0] - 32, self.sequence[1] - 32, self.sequence[2] - 32, false);
-                }
+                if (self.len == 3) self.state = .ground;
                 return null;
             },
             .discard_csi => {
@@ -326,8 +301,7 @@ pub const Parser = struct {
                     const ss3 = self.state == .ss3;
                     self.state = .ground;
                     if (!ss3 and self.len == 0 and byte == 'M') {
-                        self.state = .mouse_bytes;
-                        self.len = 0;
+                        self.state = .discard_mouse;
                         return null;
                     }
                     if (!ss3 and byte == '~' and std.mem.eql(u8, self.sequence[0..self.len], "200")) {
@@ -355,15 +329,11 @@ pub const Parser = struct {
                     self.len += 1;
                     if (self.len < self.utf8_expected) return null;
                     self.state = .ground;
-                    const cp = std.unicode.utf8Decode(self.sequence[0..self.len]) catch {
-                        self.malformed_utf8 +|= 1;
-                        return .{ .malformed = .utf8 };
-                    };
+                    const cp = std.unicode.utf8Decode(self.sequence[0..self.len]) catch return .{ .malformed = .utf8 };
                     return .{ .key = .{ .code = .{ .character = cp }, .alt = self.alt } };
                 }
                 self.state = .ground;
                 self.alt = false;
-                self.malformed_utf8 +|= 1;
             },
             .escape => {
                 self.state = .ground;
@@ -416,51 +386,38 @@ pub const Parser = struct {
             1...7, 11, 12, 14...26 => .{ .code = .{ .character = byte + 'a' - 1 }, .control = true, .alt = self.alt },
             0x20...0x7e => .{ .code = .{ .character = byte }, .alt = self.alt },
             0xc2...0xf4 => {
-                self.utf8_expected = std.unicode.utf8ByteSequenceLength(byte) catch return null;
+                self.utf8_expected = std.unicode.utf8ByteSequenceLength(byte) catch unreachable;
                 self.sequence[0] = byte;
                 self.len = 1;
                 self.state = .utf8;
                 return null;
             },
-            else => {
-                if (byte >= 0xa0) {
-                    self.malformed_utf8 +|= 1;
-                    return .{ .malformed = .utf8 };
-                }
-                return null;
-            },
+            else => return if (byte >= 0xa0) .{ .malformed = .utf8 } else null,
         };
         return .{ .key = key };
     }
 
     fn appendPaste(self: *Parser, byte: u8) void {
-        if (self.streamed) {
-            if (self.paste_status != .complete) return;
-            if (self.len == 0) {
-                self.utf8_expected = std.unicode.utf8ByteSequenceLength(byte) catch {
-                    self.paste_status = .invalid;
-                    return;
-                };
-            } else if (byte & 0xc0 != 0x80) {
-                self.paste_status = .invalid;
-                return;
-            }
-            self.sequence[self.len] = byte;
-            self.len += 1;
-            if (self.len == self.utf8_expected) {
-                _ = std.unicode.utf8Decode(self.sequence[0..self.len]) catch {
-                    self.paste_status = .invalid;
-                    return;
-                };
-                self.len = 0;
-            }
-        }
+        if (self.paste_status != .complete) return;
         if (self.paste_len == self.paste.len) {
             self.paste_overflow = true;
             return;
         }
         self.paste[self.paste_len] = byte;
         self.paste_len += 1;
+        if (!self.streamed) return;
+        if (self.len == 0) self.utf8_expected = std.unicode.utf8ByteSequenceLength(byte) catch {
+            self.paste_status = .invalid;
+            return;
+        };
+        self.len += 1;
+        if (self.len == self.utf8_expected) {
+            _ = std.unicode.utf8Decode(self.paste[self.paste_len - self.len .. self.paste_len]) catch {
+                self.paste_status = .invalid;
+                return;
+            };
+            self.len = 0;
+        }
     }
 
     fn keySequence(self: *Parser, final: u8, ss3: bool) ?Event {
@@ -567,13 +524,18 @@ pub const Parser = struct {
 
 fn number(comptime T: type, bytes: []const u8) ?T {
     if (bytes.len == 0) return null;
-    for (bytes) |b| if (b < '0' or b > '9') return null;
-    return std.fmt.parseInt(T, bytes, 10) catch null;
+    var value: T = 0;
+    for (bytes) |b| {
+        if (!std.ascii.isDigit(b)) return null;
+        value = std.math.mul(T, value, 10) catch return null;
+        value = std.math.add(T, value, b - '0') catch return null;
+    }
+    return value;
 }
 
 fn codepoint(s: []const u8) ?u21 {
     const cp = number(u21, s) orelse return null;
-    return if (cp <= 0x10ffff and !(cp >= 0xd800 and cp <= 0xdfff)) cp else null;
+    return if (std.unicode.utf8ValidCodepoint(cp)) cp else null;
 }
 
 fn modifiers(key: *Key, bytes: []const u8) bool {
@@ -739,6 +701,5 @@ test "streamed paste stages complete UTF-8 and cancellation drains through the c
     try std.testing.expectEqualStrings("123456界\x1b[20xy", output[0..used]);
     try std.testing.expect(ends == 2 and keys == 1);
     for ("\x1b[200~unclosed\x1b[20") |b| _ = p.feed(b);
-    try std.testing.expectEqual(@as(usize, 4), p.buffered().terminator_prefix);
     try std.testing.expect(p.finish().?.paste_end.status == .truncated and p.finish() == null);
 }

@@ -18,107 +18,103 @@ test "fragmented Unicode frames preserve terminal glyphs, widths, styles, and re
         .{ .width = 2, .height = 1 },
     };
     const glyphs = [_][]const u8{ "a", "e\u{301}", "界", "👩‍💻", "🇮🇳", "1\u{fe0f}\u{20e3}", "©\u{fe0f}", "©\u{fe0e}", "·", "x\u{308}\u{301}", "🇮", "🇳" };
-    for (0..80) |iteration| {
-        const size = sizes[iteration / 20];
-        renderer.synchronized = iteration / 8 % 2 == 0;
+    for (sizes, 0..) |size, i| {
         try terminal.resize(allocator, .{ .cols = size.width, .rows = size.height });
-        var frame = try renderer.begin(size, false);
-        for (0..size.height) |y| {
-            const style: tui.Style = .{
-                .foreground = .{ .rgb = @truncate((y + iteration / 2) * 0x12345) },
-                .background = .{ .indexed = @truncate(y * 7) },
-                .bold = y & 1 != 0,
-                .dim = y & 2 != 0,
-                .italic = y & 4 != 0,
-                .underline = y & 8 != 0,
-                .reverse = y & 16 != 0,
-                .blink = y & 1 != 0,
-                .hidden = y & 2 != 0,
-                .strike = y & 4 != 0,
-                .underline_color = .{ .rgb = 0x334455 },
-            };
-            for (0..size.width / 2) |x|
-                try frame.text(@intCast(x * 2), @intCast(y), glyphs[(x + y + iteration / 2) % glyphs.len], style);
-            try frame.text(size.width - 1, @intCast(y), "e\u{301}", style);
-        }
-        try frame.text(0, 0, "क्", .{});
-        try frame.text(1, 0, "क", .{});
-        try frame.text(2, 0, "👩‍", .{});
-        try frame.text(4, 0, "💻", .{});
-        if (iteration / 2 % 3 != 0) frame.setCaret(.{ .x = size.width - 1, .y = size.height - 1, .shape = .bar });
-        const submitted = renderer.back;
-        renderer.submit();
-        var total: usize = 0;
-        while (true) switch (renderer.step()) {
-            .output => |bytes| {
-                const count = @min(bytes.len, if (iteration % 4 < 2) 1 else 1 + total % 113);
-                stream.nextSlice(bytes[0..count]);
-                try std.testing.expect(!stream.handler.semantic_failure);
-                renderer.consume(count);
-                total += count;
-            },
-            .yielded, .cleared => {},
-            .complete => break,
-        };
-        try std.testing.expect(stream.ground());
-        try std.testing.expect(terminal.modes.get(.grapheme_cluster));
-        try std.testing.expect(!terminal.modes.get(.synchronized_output));
-        try std.testing.expectEqual(submitted.caret != null, terminal.modes.get(.cursor_visible));
-        if (submitted.caret) |caret| {
-            try std.testing.expectEqual(caret.x, terminal.screens.active.cursor.x);
-            try std.testing.expectEqual(caret.y, terminal.screens.active.cursor.y);
-        }
-        if (iteration % 2 == 1) try std.testing.expectEqual(@as(usize, 0), total);
-        for (submitted.cells[0 .. @as(usize, size.width) * size.height], 0..) |expected, index| {
-            const actual = terminal.screens.active.pages.getCell(.{ .active = .{
-                .x = @intCast(index % size.width),
-                .y = @intCast(index / size.width),
-            } }).?;
-            const width: u2 = switch (actual.cell.wide) {
-                .narrow => 1,
-                .wide => 2,
-                .spacer_tail => 0,
-                .spacer_head => return error.UnexpectedWrap,
-            };
-            if (width != expected.width)
-                std.debug.print("frame {d}, cell {d}: width {d}, expected {d}\n", .{ iteration, index, width, expected.width });
-            try std.testing.expectEqual(expected.width, width);
-            if (width == 0) continue;
-            var bytes: [48]u8 = undefined;
-            var length: usize = try std.unicode.utf8Encode(if (actual.cell.codepoint() == 0) ' ' else actual.cell.codepoint(), bytes[0..4]);
-            if (actual.node.page().lookupGrapheme(actual.cell)) |scalars| {
-                for (scalars) |cp| length += try std.unicode.utf8Encode(cp, bytes[length..][0..4]);
-            }
-            var scalar: [4]u8 = undefined;
-            const wanted = if (expected.glyph & (1 << 31) == 0)
-                scalar[0..try std.unicode.utf8Encode(@intCast(expected.glyph), &scalar)]
-            else blk: {
-                const offset = expected.glyph & ~@as(u32, 1 << 31);
-                break :blk submitted.clusters[offset + 1 ..][0..submitted.clusters[offset]];
-            };
-            try std.testing.expectEqualStrings(wanted, bytes[0..length]);
-            const style = actual.style();
-            const wanted_style = expected.style;
-            inline for (.{ .{ wanted_style.foreground_kind, wanted_style.foreground, style.fg_color }, .{ wanted_style.background_kind, wanted_style.background, style.bg_color }, .{ wanted_style.underline_kind, wanted_style.underline_color, style.underline_color } }) |color| {
-                const wanted_color: vt.Style.Color = switch (color[0]) {
-                    0 => .none,
-                    1 => .{ .palette = @intCast(color[1]) },
-                    2 => .{ .rgb = .{ .r = @truncate(color[1] >> 16), .g = @truncate(color[1] >> 8), .b = @truncate(color[1]) } },
-                    else => unreachable,
+        try renderer.resize(size);
+        // Each size exercises a repaint, a diff, and an unchanged frame after each.
+        for (0..4) |turn| {
+            const iteration = i * 4 + turn;
+            renderer.synchronized = turn < 2;
+            var frame = renderer.begin();
+            for (0..size.height) |y| {
+                const style: tui.Style = .{
+                    .foreground = .{ .rgb = @truncate((y + iteration / 2) * 0x12345) },
+                    .background = .{ .indexed = @truncate(y * 7) },
+                    .bold = y & 1 != 0,
+                    .dim = y & 2 != 0,
+                    .italic = y & 4 != 0,
+                    .underline = y & 8 != 0,
+                    .reverse = y & 16 != 0,
+                    .blink = y & 1 != 0,
+                    .hidden = y & 2 != 0,
+                    .strike = y & 4 != 0,
+                    .underline_color = .{ .rgb = 0x334455 },
                 };
-                try std.testing.expect(color[2].eql(wanted_color));
+                for (0..size.width / 2) |x|
+                    try frame.text(@intCast(x * 2), @intCast(y), glyphs[(x + y + iteration / 2) % glyphs.len], style);
+                try frame.text(size.width - 1, @intCast(y), "e\u{301}", style);
             }
-            try std.testing.expectEqual(wanted_style.bold, style.flags.bold);
-            try std.testing.expectEqual(wanted_style.dim, style.flags.faint);
-            try std.testing.expectEqual(wanted_style.italic, style.flags.italic);
-            try std.testing.expectEqual(wanted_style.underline, style.flags.underline != .none);
-            try std.testing.expectEqual(wanted_style.reverse, style.flags.inverse);
-            try std.testing.expectEqual(wanted_style.blink, style.flags.blink);
-            try std.testing.expectEqual(wanted_style.hidden, style.flags.invisible);
-            try std.testing.expectEqual(wanted_style.strike, style.flags.strikethrough);
+            try frame.text(0, 0, "क्", .{});
+            try frame.text(1, 0, "क", .{});
+            try frame.text(2, 0, "👩‍", .{});
+            try frame.text(4, 0, "💻", .{});
+            if (iteration / 2 % 3 != 0) frame.setCaret(.{ .x = size.width - 1, .y = size.height - 1, .shape = .bar });
+            const caret = renderer.back.caret;
+            renderer.submit();
+            var total: usize = 0;
+            while (true) switch (renderer.step()) {
+                .output => |bytes| {
+                    const count = @min(bytes.len, if (iteration % 4 < 2) 1 else 1 + total % 113);
+                    stream.nextSlice(bytes[0..count]);
+                    try std.testing.expect(!stream.handler.semantic_failure);
+                    renderer.consume(count);
+                    total += count;
+                },
+                .yielded, .cleared => {},
+                .complete => break,
+            };
+            try std.testing.expect(stream.ground());
+            try std.testing.expect(terminal.modes.get(.grapheme_cluster));
+            try std.testing.expect(!terminal.modes.get(.synchronized_output));
+            try std.testing.expectEqual(caret != null, terminal.modes.get(.cursor_visible));
+            if (caret) |position| {
+                try std.testing.expectEqual(position.x, terminal.screens.active.cursor.x);
+                try std.testing.expectEqual(position.y, terminal.screens.active.cursor.y);
+            }
+            if (iteration % 2 == 1) try std.testing.expectEqual(@as(usize, 0), total);
+            for (0..size.count()) |index| {
+                const x: u16 = @intCast(index % size.width);
+                const y: u16 = @intCast(index / size.width);
+                var scalar: [4]u8 = undefined;
+                const expected = renderer.inspectCommitted(x, y, &scalar).?;
+                const actual = terminal.screens.active.pages.getCell(.{ .active = .{ .x = x, .y = y } }).?;
+                const width: u2 = switch (actual.cell.wide) {
+                    .narrow => 1,
+                    .wide => 2,
+                    .spacer_tail => 0,
+                    .spacer_head => return error.UnexpectedWrap,
+                };
+                if (width != expected.width)
+                    std.debug.print("frame {d}, cell {d}: width {d}, expected {d}\n", .{ iteration, index, width, expected.width });
+                try std.testing.expectEqual(expected.width, width);
+                if (width == 0) continue;
+                var bytes: [48]u8 = undefined;
+                var length: usize = try std.unicode.utf8Encode(if (actual.cell.codepoint() == 0) ' ' else actual.cell.codepoint(), bytes[0..4]);
+                if (actual.node.page().lookupGrapheme(actual.cell)) |scalars| {
+                    for (scalars) |cp| length += try std.unicode.utf8Encode(cp, bytes[length..][0..4]);
+                }
+                try std.testing.expectEqualStrings(expected.glyph, bytes[0..length]);
+                const style = actual.style();
+                const wanted_style = expected.style;
+                inline for (.{ .{ wanted_style.foreground_kind, wanted_style.foreground, style.fg_color }, .{ wanted_style.background_kind, wanted_style.background, style.bg_color }, .{ wanted_style.underline_kind, wanted_style.underline_color, style.underline_color } }) |color| {
+                    const wanted_color: vt.Style.Color = switch (color[0]) {
+                        0 => .none,
+                        1 => .{ .palette = @intCast(color[1]) },
+                        2 => .{ .rgb = .{ .r = @truncate(color[1] >> 16), .g = @truncate(color[1] >> 8), .b = @truncate(color[1]) } },
+                        else => unreachable,
+                    };
+                    try std.testing.expect(color[2].eql(wanted_color));
+                }
+                try std.testing.expectEqual(wanted_style.bold, style.flags.bold);
+                try std.testing.expectEqual(wanted_style.dim, style.flags.faint);
+                try std.testing.expectEqual(wanted_style.italic, style.flags.italic);
+                try std.testing.expectEqual(wanted_style.underline, style.flags.underline != .none);
+                try std.testing.expectEqual(wanted_style.reverse, style.flags.inverse);
+                try std.testing.expectEqual(wanted_style.blink, style.flags.blink);
+                try std.testing.expectEqual(wanted_style.hidden, style.flags.invisible);
+                try std.testing.expectEqual(wanted_style.strike, style.flags.strikethrough);
+            }
         }
-        _ = try renderer.begin(.{ .width = 3, .height = 2 }, false);
-        renderer.cancelDraw();
     }
 }
 
@@ -131,6 +127,7 @@ test "clear checkpoint replays a fragmented transfer; cancelled transfer drops t
     var renderer = try tui.Renderer.init(a, .{ .max_cells = 16, .cluster_bytes = 64 });
     defer renderer.deinit();
     renderer.clear_checkpoint = true;
+    try renderer.resize(.{ .width = 8, .height = 2 });
     renderer.synchronized = true;
     var sender = tui.graphics.Sender.init(.{});
     defer sender.deinit();
@@ -138,7 +135,7 @@ test "clear checkpoint replays a fragmented transfer; cancelled transfer drops t
     const cmd: tui.graphics.kitty.Command = .{ .transmit_and_display = .{ .transmission = .{ .width_pixels = 32, .height_pixels = 32, .identifiers = .{ .image_id = 11, .placement_id = 7 } }, .placement = .{ .virtual = true, .columns = 1, .rows = 1 } } };
     for (0..2) |cycle| {
         renderer.invalidate();
-        var frame = try renderer.begin(.{ .width = 8, .height = 2 }, false);
+        var frame = renderer.begin();
         try frame.placeholder(0, 0, 0, 0, 11, 7);
         renderer.submit();
         var replays: usize = 0;

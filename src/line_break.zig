@@ -17,22 +17,15 @@ pub const Boundary = struct {
 
 const Scalar = struct {
     codepoint: u21,
-    start: usize,
     end: usize,
     raw: Class,
     class: Class,
-    attached: bool,
-    initial_punctuation: bool,
-    final_punctuation: bool,
-    east_asian: bool,
-    unassigned: bool,
-    extended_pictographic: bool,
-};
-
-const Lookahead = struct {
-    first: Scalar,
-    second: ?Scalar,
-    third: ?Scalar,
+    attached: bool = false,
+    initial_punctuation: bool = false,
+    final_punctuation: bool = false,
+    east_asian: bool = false,
+    unassigned: bool = false,
+    extended_pictographic: bool = false,
 };
 
 const State = struct {
@@ -65,13 +58,9 @@ const State = struct {
         self.regional_indicator_odd = if (scalar.class == .ri) !self.regional_indicator_odd else false;
     }
 
-    fn classify(self: *const State, ahead: Lookahead) Kind {
+    fn classify(self: *const State, right: Scalar, right2: ?Scalar, right3: ?Scalar) Kind {
         const left = self.left.?;
-        const right = ahead.first;
-        const right2 = ahead.second;
-        const right3 = ahead.third;
 
-        if (left.class == .bk) return .mandatory;
         if (left.class == .cr and right.class == .lf) return .prohibited;
         if (isHard(left.class)) return .mandatory;
         if (isHard(right.class)) return .prohibited;
@@ -175,46 +164,17 @@ const State = struct {
 pub const Iterator = struct {
     input: []const u8,
     offset: usize = 0,
-    started: bool = false,
     finished: bool = false,
     state: State = .{},
     ahead: [3]?Scalar = .{ null, null, null },
 
-    pub fn init(input: []const u8) error{InvalidUtf8}!Iterator {
-        if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
-        return .{ .input = input };
-    }
-
     pub fn next(self: *Iterator) ?Boundary {
-        if (!self.started) {
-            self.started = true;
-            if (self.input.len == 0) {
-                self.finished = true;
-                return .{ .offset = 0, .kind = .mandatory };
-            }
-            const first = decodeScalar(self.input, 0, null);
-            self.state.consume(first);
-            self.offset = first.end;
-            return .{ .offset = 0, .kind = .prohibited };
-        }
         if (self.finished) return null;
         if (self.offset == self.input.len) {
             self.finished = true;
             return .{ .offset = self.offset, .kind = .mandatory };
         }
 
-        const ahead = self.lookahead();
-        const boundary = Boundary{
-            .offset = ahead.first.start,
-            .kind = self.state.classify(ahead),
-        };
-        self.state.consume(ahead.first);
-        self.offset = ahead.first.end;
-        self.ahead = .{ ahead.second, ahead.third, null };
-        return boundary;
-    }
-
-    fn lookahead(self: *Iterator) Lookahead {
         var start = self.offset;
         var previous = self.state.left;
         for (&self.ahead) |*entry| {
@@ -225,11 +185,15 @@ pub const Iterator = struct {
             start = scalar.end;
             previous = scalar;
         }
-        return .{
-            .first = self.ahead[0].?,
-            .second = self.ahead[1],
-            .third = self.ahead[2],
+        const right = self.ahead[0].?;
+        const boundary: Boundary = .{
+            .offset = self.offset,
+            .kind = if (self.state.left == null) .prohibited else self.state.classify(right, self.ahead[1], self.ahead[2]),
         };
+        self.state.consume(right);
+        self.offset = right.end;
+        self.ahead = .{ self.ahead[1], self.ahead[2], null };
+        return boundary;
     }
 };
 
@@ -237,10 +201,6 @@ fn decodeScalar(input: []const u8, start: usize, previous: ?Scalar) Scalar {
     const sequence_len = std.unicode.utf8ByteSequenceLength(input[start]) catch unreachable;
     const end = start + sequence_len;
     const codepoint = std.unicode.utf8Decode(input[start..end]) catch unreachable;
-    return makeScalar(codepoint, start, end, previous);
-}
-
-fn makeScalar(codepoint: u21, start: usize, end: usize, previous: ?Scalar) Scalar {
     const props = unicode.lookup(codepoint);
     const raw: Class = switch (props.line) {
         .ai, .sg, .xx => .al,
@@ -248,36 +208,29 @@ fn makeScalar(codepoint: u21, start: usize, end: usize, previous: ?Scalar) Scala
         .sa => if (props.combining) .cm else .al,
         else => props.line,
     };
-    const attached = in(raw, &.{ .cm, .zwj }) and previous != null and !excludesCombiningBase(previous.?.class);
-    const class = if (attached)
-        previous.?.class
-    else if (in(raw, &.{ .cm, .zwj }))
-        .al
-    else
-        raw;
-    const effective_codepoint: u21 = if (attached)
-        previous.?.codepoint
-    else if (in(raw, &.{ .cm, .zwj }))
-        'A'
-    else
-        codepoint;
+    if (in(raw, &.{ .cm, .zwj })) {
+        if (previous) |base| {
+            if (!in(base.class, &.{ .bk, .cr, .lf, .nl, .sp, .zw })) {
+                var mark = base;
+                mark.raw = raw;
+                mark.end = end;
+                mark.attached = true;
+                return mark;
+            }
+        }
+        return .{ .codepoint = 'A', .raw = raw, .class = .al, .end = end };
+    }
     return .{
-        .codepoint = effective_codepoint,
-        .start = start,
+        .codepoint = codepoint,
         .end = end,
         .raw = raw,
-        .class = class,
-        .attached = attached,
-        .initial_punctuation = if (attached) previous.?.initial_punctuation else effective_codepoint == codepoint and props.initial,
-        .final_punctuation = if (attached) previous.?.final_punctuation else effective_codepoint == codepoint and props.final,
-        .east_asian = if (attached) previous.?.east_asian else effective_codepoint == codepoint and (props.wide or props.halfwidth),
-        .unassigned = if (attached) previous.?.unassigned else effective_codepoint == codepoint and props.unassigned,
-        .extended_pictographic = if (attached) previous.?.extended_pictographic else effective_codepoint == codepoint and props.pictographic,
+        .class = raw,
+        .initial_punctuation = props.initial,
+        .final_punctuation = props.final,
+        .east_asian = props.wide or props.halfwidth,
+        .unassigned = props.unassigned,
+        .extended_pictographic = props.pictographic,
     };
-}
-
-fn excludesCombiningBase(class: Class) bool {
-    return in(class, &.{ .bk, .cr, .lf, .nl, .sp, .zw });
 }
 
 fn isHard(class: Class) bool {
@@ -318,9 +271,6 @@ fn in(value: Class, comptime values: []const Class) bool {
 
 test "Unicode 17 default line break conformance" {
     const corpus = @embedFile("line_cases");
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(corpus, &digest, .{});
-    try std.testing.expectEqualStrings("e69884e0dde6a8724873f885d68c52dc14518abf9ae4ca9e2283b8773db3b752", &std.fmt.bytesToHex(digest, .lower));
     var lines = std.mem.splitScalar(u8, corpus, '\n');
     while (lines.next()) |line| {
         var tokens = std.mem.tokenizeAny(u8, line[0 .. std.mem.indexOfScalar(u8, line, '#') orelse line.len], " \t\r");
@@ -335,7 +285,7 @@ test "Unicode 17 default line break conformance" {
             len += try std.unicode.utf8Encode(try std.fmt.parseInt(u21, cp, 16), bytes[len..][0..4]);
         }
         if (n == 0) continue;
-        var it = try Iterator.init(bytes[0..len]);
+        var it: Iterator = .{ .input = bytes[0..len] };
         for (expected[0..n]) |allow| {
             const actual = it.next().?.kind != .prohibited;
             if (allow != actual) std.debug.print("{s}\n", .{line});

@@ -15,6 +15,7 @@ pub fn main(init: std.process.Init) !void {
     const cells = @as(u32, size.width) * size.height;
     var renderer = try tui.Renderer.init(init.gpa, .{ .max_cells = cells, .cluster_bytes = cells * 16 });
     defer renderer.deinit();
+    try renderer.resize(size);
     for (std.enums.values(Scenario)) |scenario| {
         try draw(&renderer, scenario, 1, size);
         while (true) switch (renderer.step()) {
@@ -55,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn draw(renderer: *tui.Renderer, scenario: Scenario, iteration: usize, size: tui.Size) !void {
-    var frame = try renderer.begin(size, false);
+    var frame = renderer.begin();
     switch (scenario) {
         .unchanged, .one_cell => try frame.text(2, 2, if (scenario == .one_cell and iteration & 1 == 0) "A" else "B", .{}),
         .full_frame => frame.fill(.{ .background = .{ .indexed = @intCast(iteration & 1) } }),
