@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Zig and libvterm headers
+        run: |
+          curl --fail --location --retry 3 \
+            https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz \
+            --output "$RUNNER_TEMP/zig.tar.xz"
+          echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.1" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y libvterm-dev
+      - name: Formatting
+        run: zig fmt --check build.zig build.zig.zon src test bench examples
+      - name: Debug verification
+        run: zig build test test-pty test-screen test-terminal test-stress -Dterminal-tests=true -j2
+      - name: ReleaseSafe verification
+        run: zig build test test-pty test-screen test-terminal test-stress -Dterminal-tests=true -Doptimize=ReleaseSafe -j2
+      - name: Build and verify Unicode generation
+        run: |
+          zig build -Doptimize=ReleaseSafe -j2
+          python3 tools/unicode.py --check
+      - name: Benchmark smoke
+        run: zig build bench -- 100 80 24
